@@ -12,7 +12,7 @@ Progettato per **MacBook Apple Silicon (serie M)** e ottimizzato per un'**elabor
 * 🧠 **Sintesi del contesto intelligente**: Genera brevi spiegazioni sul *perché* determinate sezioni sono rilevanti per i tuoi obiettivi di studio.
 * 🔌 **Compatibilità MCP Universale**: Si connette senza problemi tramite trasporto `stdio` ai client MCP come **Cline (VS Code)**, **Cursor**, **Claude Desktop**, **Chatbox**, **ChatGPT Desktop**.
 
-## 🛠 Stack Tecnologico
+## 🛠 Tech Stack
 
 * **Protocollo**: [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) (trasporto `stdio`)
 * **Runtime**: Python 3.10+
@@ -20,7 +20,7 @@ Progettato per **MacBook Apple Silicon (serie M)** e ottimizzato per un'**elabor
 * **Ragionamento locale / Sintesi**: `qwen3:8b` (o `qwen2.5-coder:7b`) tramite Ollama
 * **Motore OCR**: Tesseract (`pytesseract`)
 
-## 📋 Requisiti Prerequisiti
+## 📋 Prerequisiti
 
 1. **Python 3.10+**
 2. **Ollama**: Installato e in esecuzione sul tuo sistema ([ollama.com](https://ollama.com)).
