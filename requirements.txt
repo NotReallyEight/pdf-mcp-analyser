@@ -1,0 +1,9 @@
+# Dipendenze Python runtime per pdf_mcp_server.py e gli script di test.
+# Le versioni sono quelle verificate nell'ambiente virtuale del progetto.
+
+mcp==2.3.0
+numpy==2.5.4
+ollama==0.6.3
+Pillow==13.0.0
+PyMuPDF==2.0
+pytesseract==0.3.13
