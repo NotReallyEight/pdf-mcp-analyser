@@ -1,4 +1,4 @@
-# Dipendenze Python runtime per pdf_mcp_server.py e gli script di test.
+# Dipendenze Python runtime per pdf_mcp_server.py.
 # Le versioni sono quelle verificate nell'ambiente virtuale del progetto.
 
 mcp==2.3.0
