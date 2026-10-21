@@ -1,36 +1,66 @@
-import sys
-import os
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import io
-import re
 import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
+# Tesseract usa OpenMP: con N processi in parallelo ognuno aprirebbe N thread
+# (oversubscription). Va impostato PRIMA di lanciare i sottoprocessi.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+import httpx
 import numpy as np
+import ollama
 import pymupdf as fitz
 import pytesseract
 from PIL import Image
-import ollama
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-import tempfile
 
-pytesseract.pytesseract.DEFAULT_ENCODING = "latin-1"
-
-mcp = MCPServer("PDF Range Analyzer")
-
-EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen3:8b"
+# ---------------------------------------------------------------------------
+# Configurazione (tutto sovrascrivibile da variabili d'ambiente)
+# ---------------------------------------------------------------------------
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:8b")
 
 CHUNK_SIZE = 4  # pagine per chunk
 STRIDE = 2  # passo della finestra mobile
 PIECE_CHARS = 2000  # caratteri per pezzo di embedding
 MAX_PIECES_PER_PAGE = 4  # massimo pezzi di embedding per pagina
 EMBED_BATCH = 32  # pezzi per chiamata a ollama.embed
-IGNORED_PREFIXES = ("logistica",)
-MAX_CHAPTER_PAGES = (
-    90  # oltre questa lunghezza, il capitolo non viene usato per allineare l'intervallo
+MAX_CHAPTER_PAGES = 90  # oltre questa lunghezza il capitolo non allinea l'intervallo
+
+OCR_MIN_CHARS = 50  # sotto questa soglia la pagina viene considerata scansione
+OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
+OCR_LANG = os.environ.get("OCR_LANG", "ita+eng")
+OCR_WORKERS = int(os.environ.get("OCR_WORKERS", min(8, os.cpu_count() or 4)))
+OCR_PAGE_TIMEOUT = 60  # secondi massimi per una singola pagina
+
+MAX_PDF_MB = int(os.environ.get("MAX_PDF_MB", "500"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "3000"))
+MAX_SECTIONS = 60
+MAX_SUMMARY_CHARS = 100_000
+MAX_EXPLAIN = 3  # passaggi da spiegare con l'LLM
+EXCERPT_CHARS = 900  # caratteri per pagina nell'estratto passato all'LLM
+OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
+MAX_CONCURRENT_ANALYSES = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "2"))
+
+IGNORED_PREFIXES = tuple(
+    p.strip().lower()
+    for p in os.environ.get("IGNORED_SECTION_PREFIXES", "logistica").split(",")
+    if p.strip()
 )
 
 # Cartelle da cui è consentito leggere i PDF (separate da os.pathsep).
@@ -41,21 +71,46 @@ BASE_DIRS = [
     if d.strip()
 ]
 
+# Le cache vivono fuori dalle cartelle dei PDF (che possono essere read-only
+# o sincronizzate) e sono legate al contenuto del file (dimensione + mtime).
+CACHE_DIR = Path(
+    os.environ.get("PDF_CACHE_DIR", "~/.cache/pdf-mcp-analyser")
+).expanduser()
 
-def log(msg: str):
-    # Con il trasporto stdio stdout è riservato al protocollo MCP.
-    print(msg, file=sys.stderr, flush=True)
+# Con il trasporto stdio stdout è riservato al protocollo MCP: log su stderr.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("pdf_range_analyzer")
+
+mcp = MCPServer("PDF Range Analyzer")
+_ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
+
+_ANALYSIS_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+_locks_guard = threading.Lock()
+_path_locks: dict[str, threading.Lock] = {}
 
 
+def _path_lock(path: str) -> threading.Lock:
+    """Un lock per PDF: due richieste sullo stesso libro non rifanno l'OCR due volte."""
+    with _locks_guard:
+        return _path_locks.setdefault(path, threading.Lock())
+
+
+# ---------------------------------------------------------------------------
+# Errori
+# ---------------------------------------------------------------------------
 class AnalysisError(Exception):
-    def __init__(self, code: str, message: str, hint: str = None):
+    def __init__(self, code: str, message: str, hint: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
 
 
-def _error(code: str, message: str, hint: str = None) -> str:
+def _error(code: str, message: str, hint: str | None = None) -> str:
     payload = {"status": "error", "error_code": code, "message": message}
     if hint:
         payload["hint"] = hint
@@ -92,151 +147,180 @@ def validate_pdf_path(pdf_path: str) -> str:
             "Controlla il percorso assoluto (attenzione a spazi e maiuscole).",
         )
 
+    size_mb = os.path.getsize(path) / 1e6
+    if size_mb > MAX_PDF_MB:
+        raise AnalysisError(
+            "PDF_TROPPO_GRANDE",
+            f"Il PDF pesa {size_mb:.0f} MB (limite {MAX_PDF_MB} MB).",
+            "Alza il limite con la variabile MAX_PDF_MB se necessario.",
+        )
+
     return path
 
 
 # ---------------------------------------------------------------------------
-# Cache del testo estratto e OCR
+# Cache su disco
 # ---------------------------------------------------------------------------
-def _ocr_page(pdf_path: str, page_idx: int):
-    """Elabora una singola pagina in un thread separato in modo thread-safe."""
-    doc = fitz.open(pdf_path)
+def _cache_file(pdf_path: str, kind: str) -> Path:
+    """Il nome contiene un hash di percorso+dimensione+mtime: se il PDF cambia,
+    la cache vecchia non viene più trovata (nessuna cache obsoleta)."""
+    st = os.stat(pdf_path)
+    digest = hashlib.sha256(
+        f"{pdf_path}|{st.st_size}|{st.st_mtime_ns}".encode()
+    ).hexdigest()[:20]
+    return CACHE_DIR / f"{digest}.{kind}"
 
+
+def _store_cache(target: Path, data: bytes) -> None:
+    """Scrittura atomica; un errore di cache non deve far fallire l'analisi."""
+    tmp = None
     try:
-        page = doc[page_idx]
-        text = page.get_text("text").strip()
-
-        if len(text) < 50:
-            pix = page.get_pixmap(dpi=150)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-            temp_path = None
-
-            try:
-                with tempfile.NamedTemporaryFile(
-                    suffix=".png", delete=False
-                ) as temp_file:
-                    temp_path = temp_file.name
-
-                img.save(temp_path, format="PNG")
-                text = pytesseract.image_to_string(temp_path, lang="ita+eng").strip()
-
-            except Exception:
-                log(f"Errore OCR alla pagina PDF {page_idx + 1}")
-                raise
-
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-        return {"page": page_idx + 1, "text": text}
-
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+        tmp = None
+    except OSError as e:
+        logger.warning("Impossibile salvare la cache %s: %s", target.name, e)
     finally:
-        doc.close()
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
-def _read_valid_page_cache(cache_file: str):
-    """Carica la cache solo se è JSON valido con la struttura attesa."""
-    with open(cache_file, "r", encoding="utf-8") as f:
-        cached_pages = json.load(f)
-
-    if not isinstance(cached_pages, list):
-        raise ValueError("La cache non contiene una lista di pagine.")
-
-    for index, page in enumerate(cached_pages, start=1):
-        if (
-            not isinstance(page, dict)
-            or not isinstance(page.get("page"), int)
-            or not isinstance(page.get("text"), str)
-        ):
-            raise ValueError(f"Struttura non valida nella cache alla voce {index}.")
-
-    return cached_pages
-
-
-def load_pages(pdf_path: str):
-    log(f"Python in uso: {sys.executable}")
-    log(
-        f"Tesseract configurato in pytesseract: "
-        f"{pytesseract.pytesseract.tesseract_cmd}"
-    )
-    cache_file = pdf_path + ".cache.json"
-
-    if os.path.exists(cache_file):
-        try:
-            cached_pages = _read_valid_page_cache(cache_file)
-
-            # Verifica anche che la cache corrisponda al numero di pagine del PDF.
-            with fitz.open(pdf_path) as doc:
-                total_pdf_pages = len(doc)
-
-            if len(cached_pages) == total_pdf_pages:
-                log(f"Cache testo valida: {cache_file}")
-                return cached_pages
-
-            log(
-                f"Cache non coerente con il PDF "
-                f"({len(cached_pages)} voci nella cache, {total_pdf_pages} pagine nel PDF). "
-                "Verrà rigenerata."
-            )
-
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
-            log(f"Cache testo non valida ({type(e).__name__}: {e}). Verrà rigenerata.")
-        except OSError as e:
-            log(f"Impossibile leggere la cache ({e}). Verrà rigenerata.")
-
-        # La cache è rigenerabile. Se non si riesce a rimuoverla, segnala l'errore.
-        try:
-            os.remove(cache_file)
-        except OSError as e:
-            raise AnalysisError(
-                "CACHE_NON_LEGGIBILE",
-                f"Impossibile rimuovere la cache non valida: {e}",
-                "Controlla i permessi del file .cache.json.",
-            )
-
+def _load_pages_cache(cache_file: Path, total: int) -> list[str] | None:
+    if not cache_file.exists():
+        return None
     try:
-        with fitz.open(pdf_path) as doc:
-            total = len(doc)
+        pages = json.loads(cache_file.read_text(encoding="utf-8"))
+        if (
+            isinstance(pages, list)
+            and len(pages) == total
+            and all(isinstance(p, str) for p in pages)
+        ):
+            return pages
+        logger.info("Cache testo non coerente: verrà rigenerata.")
+    except (
+        OSError,
+        ValueError,
+    ) as e:  # UnicodeDecodeError e JSONDecodeError sono ValueError
+        logger.warning("Cache testo non valida (%s): verrà rigenerata.", e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Estrazione testo + OCR
+# ---------------------------------------------------------------------------
+def _ocr_image(img: Image.Image) -> str:
+    try:
+        # Byte grezzi + decodifica tollerante: evita l'UnicodeDecodeError di
+        # pytesseract senza forzare latin-1 (che rovinerebbe gli accenti).
+        raw = pytesseract.image_to_string(
+            img,
+            lang=OCR_LANG,
+            timeout=OCR_PAGE_TIMEOUT,
+            output_type=pytesseract.Output.BYTES,
+        )
+        return raw.decode("utf-8", errors="replace").replace("\ufffd", "").strip()
+    except pytesseract.TesseractNotFoundError:
+        raise
+    except Exception as e:  # una pagina illeggibile non deve far fallire il libro
+        logger.warning("OCR fallito su una pagina: %s", e)
+        return ""
+
+
+def _extract_texts(doc, total: int) -> list[str]:
+    """PyMuPDF non è thread-safe: lettura e rendering avvengono nel solo thread
+    chiamante (documento aperto una volta sola). Solo Tesseract, che gira in
+    sottoprocessi, è parallelizzato. Le immagini in coda sono limitate per non
+    riempire la RAM."""
+    texts = [""] * total
+    pending: deque = deque()
+    max_pending = OCR_WORKERS * 2
+    ocr_done = 0
+
+    def drain(limit: int):
+        nonlocal ocr_done
+        while len(pending) > limit:
+            idx, fut, fallback = pending.popleft()
+            texts[idx] = fut.result() or fallback
+            ocr_done += 1
+            if ocr_done % 50 == 0:
+                logger.info("OCR: %d pagine completate", ocr_done)
+
+    with ThreadPoolExecutor(max_workers=OCR_WORKERS) as ex:
+        for idx in range(total):
+            page = doc[idx]
+            text = page.get_text("text").strip()
+
+            if len(text) >= OCR_MIN_CHARS:
+                texts[idx] = text
+                continue
+
+            # Scala di grigi: ~3x meno dati e nessuna codifica/decodifica PNG.
+            pix = page.get_pixmap(dpi=OCR_DPI, colorspace=fitz.csGRAY, alpha=False)
+            img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+            pending.append((idx, ex.submit(_ocr_image, img), text))
+            drain(max_pending)
+
+        drain(0)
+
+    return texts
+
+
+def load_pages(pdf_path: str) -> list[str]:
+    """Restituisce il testo di ogni pagina (indice 0 = pagina PDF 1)."""
+    try:
+        doc = fitz.open(pdf_path)
     except Exception as e:
         raise AnalysisError("PDF_ILLEGGIBILE", f"Impossibile aprire il PDF: {e}")
 
-    log(f"OCR su {total} pagine...")
-    t0 = time.time()
+    with doc:
+        if doc.needs_pass:
+            raise AnalysisError(
+                "PDF_PROTETTO", "Il PDF è protetto da password.", "Rimuovi la password."
+            )
 
-    try:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            pages = list(ex.map(lambda i: _ocr_page(pdf_path, i), range(total)))
-    except pytesseract.TesseractNotFoundError:
-        raise AnalysisError(
-            "TESSERACT_MANCANTE",
-            "Tesseract OCR non è installato o non è nel PATH.",
-            "Installa con `brew install tesseract tesseract-lang`.",
-        )
+        total = len(doc)
+        if total == 0:
+            raise AnalysisError("PDF_VUOTO", "Il PDF non contiene pagine.")
+        if total > MAX_PAGES:
+            raise AnalysisError(
+                "PDF_TROPPE_PAGINE",
+                f"Il PDF ha {total} pagine (limite {MAX_PAGES}).",
+                "Alza il limite con la variabile MAX_PAGES se necessario.",
+            )
 
-    log(f"OCR completato in {time.time() - t0:.1f}s")
+        cache_file = _cache_file(pdf_path, f"pages.{OCR_LANG}.{OCR_DPI}.json")
+        cached = _load_pages_cache(cache_file, total)
+        if cached is not None:
+            logger.info("Cache testo valida: %s", cache_file.name)
+            return cached
 
-    if sum(len(p["text"]) for p in pages) < 200:
+        logger.info("Estrazione testo/OCR su %d pagine...", total)
+        t0 = time.time()
+        try:
+            texts = _extract_texts(doc, total)
+        except pytesseract.TesseractNotFoundError:
+            raise AnalysisError(
+                "TESSERACT_MANCANTE",
+                "Tesseract OCR non è installato o non è nel PATH.",
+                "Installa con `brew install tesseract tesseract-lang`.",
+            )
+        logger.info("Estrazione completata in %.1fs", time.time() - t0)
+
+    if sum(len(t) for t in texts) < 200:
         raise AnalysisError(
             "PDF_SENZA_TESTO",
             "Dal PDF è stato estratto praticamente nessun testo.",
             "Il file potrebbe essere protetto oppure l'OCR potrebbe non aver riconosciuto le pagine.",
         )
 
-    # Scrittura atomica: evita di lasciare una cache parziale se la scrittura viene interrotta.
-    temp_cache = cache_file + ".tmp"
-    try:
-        with open(temp_cache, "w", encoding="utf-8") as f:
-            json.dump(pages, f, ensure_ascii=False)
-        os.replace(temp_cache, cache_file)
-    finally:
-        if os.path.exists(temp_cache):
-            try:
-                os.remove(temp_cache)
-            except OSError:
-                pass
-
-    return pages
+    _store_cache(cache_file, json.dumps(texts, ensure_ascii=False).encode("utf-8"))
+    return texts
 
 
 # ---------------------------------------------------------------------------
@@ -246,95 +330,84 @@ def normalize(m: np.ndarray) -> np.ndarray:
     return m / np.maximum(np.linalg.norm(m, axis=-1, keepdims=True), 1e-9)
 
 
-def embed_batch(texts):
+def embed_batch(texts: list[str]) -> np.ndarray:
     out = []
     for i in range(0, len(texts), EMBED_BATCH):
-        resp = ollama.embed(model=EMBED_MODEL, input=texts[i : i + EMBED_BATCH])
+        resp = _ollama.embed(model=EMBED_MODEL, input=texts[i : i + EMBED_BATCH])
         out.extend(resp["embeddings"])
     return np.array(out, dtype=np.float32)
 
 
-def page_embeddings(pdf_path: str, pages):
+def page_embeddings(pdf_path: str, texts: list[str]) -> np.ndarray:
     """Un vettore normalizzato per pagina, calcolato una volta e salvato in .npy."""
-    cache = pdf_path + f".emb.{EMBED_MODEL.replace(':', '_')}.npy"
+    model_tag = re.sub(r"[^\w.-]", "_", EMBED_MODEL)
+    # Dipende dal testo, quindi anche dai parametri OCR che lo hanno prodotto.
+    cache = _cache_file(
+        pdf_path,
+        f"emb.{model_tag}.{PIECE_CHARS}x{MAX_PIECES_PER_PAGE}.{OCR_LANG}.{OCR_DPI}.npy",
+    )
 
-    if os.path.exists(cache):
+    if cache.exists():
         try:
             arr = np.load(cache, allow_pickle=False)
-            if arr.ndim == 2 and arr.shape[0] == len(pages):
+            if arr.ndim == 2 and arr.shape[0] == len(texts):
+                logger.info("Cache embedding valida: %s", cache.name)
                 return arr
-            log(
-                "Cache embedding non coerente con il numero di pagine: verrà rigenerata."
-            )
+            logger.info("Cache embedding non coerente: verrà rigenerata.")
         except (OSError, ValueError) as e:
-            log(f"Cache embedding non valida ({e}): verrà rigenerata.")
+            logger.warning("Cache embedding non valida (%s): verrà rigenerata.", e)
 
-    pieces, owner = [], []
+    pieces: list[str] = []
+    starts: list[int] = []  # indice del primo pezzo di ogni pagina
 
-    for idx, page in enumerate(pages):
-        text = (page["text"] or "").strip() or "(pagina vuota)"
+    for text in texts:
+        text = text.strip() or "(pagina vuota)"
         limit = min(len(text), PIECE_CHARS * MAX_PIECES_PER_PAGE)
-
+        starts.append(len(pieces))
         for k in range(0, limit, PIECE_CHARS):
             pieces.append("search_document: " + text[k : k + PIECE_CHARS])
-            owner.append(idx)
 
-    if not pieces:
-        raise AnalysisError(
-            "PDF_SENZA_TESTO",
-            "Non ci sono contenuti testuali da trasformare in embedding.",
-        )
-
-    log(
-        f"Embedding di {len(pages)} pagine ({len(pieces)} pezzi) in batch da {EMBED_BATCH}..."
+    logger.info(
+        "Embedding di %d pagine (%d pezzi) in batch da %d...",
+        len(texts),
+        len(pieces),
+        EMBED_BATCH,
     )
     t0 = time.time()
     vecs = embed_batch(pieces)
 
-    arr = np.zeros((len(pages), vecs.shape[1]), dtype=np.float32)
-    np.add.at(arr, np.array(owner), vecs)
-    arr = normalize(arr)
+    # Ogni pagina ha almeno un pezzo e i pezzi sono contigui: reduceat somma
+    # i segmenti in un'unica operazione vettoriale (più veloce di np.add.at).
+    arr = normalize(np.add.reduceat(vecs, starts, axis=0))
 
-    temp_cache = cache + ".tmp"
-    try:
-        with open(temp_cache, "wb") as f:
-            np.save(f, arr)
-        os.replace(temp_cache, cache)
-    finally:
-        if os.path.exists(temp_cache):
-            try:
-                os.remove(temp_cache)
-            except OSError:
-                pass
+    buf = io.BytesIO()
+    np.save(buf, arr)
+    _store_cache(cache, buf.getvalue())
 
-    log(f"Embedding completati in {time.time() - t0:.1f}s (salvati in cache)")
+    logger.info("Embedding completati in %.1fs (salvati in cache)", time.time() - t0)
     return arr
 
 
 # ---------------------------------------------------------------------------
-# Chunk, riassunto, punteggi
+# Chunk, punteggi, regione
 # ---------------------------------------------------------------------------
-def build_chunks(pages, page_vecs):
-    chunks = []
-
-    for i in range(0, len(pages), STRIDE):
-        sl = slice(i, i + CHUNK_SIZE)
-        cp = pages[sl]
-        text = "\n\n".join(p["text"] for p in cp if p["text"])
-
-        chunks.append(
-            {
-                "start_page": cp[0]["page"],
-                "end_page": cp[-1]["page"],
-                "text": text if text.strip() else "(vuoto)",
-                "vector": page_vecs[sl].mean(axis=0),
-            }
-        )
-
-    return chunks
+def build_chunks(page_vecs: np.ndarray):
+    """Finestre mobili sulle pagine. Restituisce confini [start, end) a base 0 e
+    il vettore medio di ogni finestra (somme cumulative: O(n), nessuna copia di testo).
+    """
+    n = len(page_vecs)
+    bounds = np.array(
+        [(s, min(s + CHUNK_SIZE, n)) for s in range(0, n, STRIDE)], dtype=np.int64
+    )
+    csum = np.vstack(
+        [np.zeros((1, page_vecs.shape[1]), np.float32), np.cumsum(page_vecs, axis=0)]
+    )
+    sizes = (bounds[:, 1] - bounds[:, 0])[:, None]
+    means = (csum[bounds[:, 1]] - csum[bounds[:, 0]]) / sizes
+    return bounds, normalize(means)
 
 
-def split_summary(summary: str):
+def split_summary(summary: str) -> list[str]:
     parts = [p.strip() for p in re.split(r"\n#{1,6}\s*", "\n" + summary) if p.strip()]
 
     if len(parts) <= 1:
@@ -351,21 +424,13 @@ def zscore_cols(sims: np.ndarray) -> np.ndarray:
     return (sims - sims.mean(axis=0)) / std
 
 
-def grow_region(scores: np.ndarray, keep: float = 0.5):
-    best = int(np.argmax(scores))
-    thr = scores.mean() + keep * (scores[best] - scores.mean())
-    lo = hi = best
-
-    while lo > 0 and scores[lo - 1] >= thr:
-        lo -= 1
-    while hi < len(scores) - 1 and scores[hi + 1] >= thr:
-        hi += 1
-
-    return lo, hi
-
-
 def grow_region_pages(page_scores: np.ndarray, smooth: int = 5, keep: float = 0.25):
     """Individua una regione contigua sui punteggi di pagina smussati."""
+    smooth = min(smooth, len(page_scores))
+    if smooth % 2 == 0:  # la finestra deve essere dispari per mantenere la lunghezza
+        smooth -= 1
+    smooth = max(smooth, 1)
+
     pad = smooth // 2
     sm = np.convolve(
         np.pad(page_scores, pad, mode="edge"), np.ones(smooth) / smooth, mode="valid"
@@ -384,6 +449,23 @@ def grow_region_pages(page_scores: np.ndarray, smooth: int = 5, keep: float = 0.
     return lo, hi
 
 
+def pick_top_chunks(bounds, scores, lo, hi, k):
+    """I k chunk migliori nella regione, senza sovrapposizioni (con stride 2 e
+    finestra 4 i chunk adiacenti condividono metà pagine: i primi 3 sarebbero
+    quasi lo stesso passaggio)."""
+    cand = [i for i, (s, e) in enumerate(bounds) if e - 1 >= lo and s <= hi]
+    cand.sort(key=lambda i: scores[i], reverse=True)
+
+    chosen: list[int] = []
+    for i in cand:
+        s, e = bounds[i]
+        if all(e <= bounds[j][0] or s >= bounds[j][1] for j in chosen):
+            chosen.append(i)
+            if len(chosen) == k:
+                break
+    return sorted(chosen)
+
+
 # ---------------------------------------------------------------------------
 # Capitoli reali: TOC del PDF, altrimenti regex "Capitolo N"
 # ---------------------------------------------------------------------------
@@ -392,19 +474,15 @@ CHAPTER_RE = re.compile(
     r"(?:[-–—.][ \t]*)?(?:[A-ZÀ-Ý][^:\n]{2,69})?$",
     re.M,
 )
+SCANNER_NAME_RE = re.compile(r"^[A-Za-z]{1,6}[_\-]?\d{5,}")
 
 
 def _finalize_chapters(entries, n_pages):
     chapters = []
-
     for i, (title, start) in enumerate(entries):
         end = entries[i + 1][1] - 1 if i + 1 < len(entries) else n_pages
         chapters.append({"title": title, "start": start, "end": max(start, end)})
-
     return chapters
-
-
-SCANNER_NAME_RE = re.compile(r"^[A-Za-z]{1,6}[_\-]?\d{5,}")
 
 
 def _toc_is_usable(entries) -> bool:
@@ -417,8 +495,8 @@ def _toc_is_usable(entries) -> bool:
     return bool(entries) and good / len(entries) >= 0.7
 
 
-def detect_chapters(pdf_path: str, pages):
-    n = len(pages)
+def detect_chapters(pdf_path: str, texts: list[str]):
+    n = len(texts)
 
     # 1. Segnalibri del PDF (livello 1).
     try:
@@ -433,32 +511,28 @@ def detect_chapters(pdf_path: str, pages):
             },
             key=lambda entry: entry[1],
         )
-
         if len(entries) >= 3 and _toc_is_usable(entries):
             return _finalize_chapters(entries, n), "toc"
     except Exception as e:
-        log(f"Impossibile leggere il TOC del PDF: {e}")
+        logger.warning("Impossibile leggere il TOC del PDF: %s", e)
 
     # 2. Regex sul testo estratto.
-    occurrences = {}
+    occurrences: dict[int, list] = {}
 
-    for page in pages:
-        matches = list(CHAPTER_RE.finditer(page["text"] or ""))
+    for page_no, text in enumerate(texts, start=1):
+        matches = list(CHAPTER_RE.finditer(text))
 
-        if len({int(match.group(1)) for match in matches}) >= 3:
+        if len({int(m.group(1)) for m in matches}) >= 3:
             continue  # Probabile pagina dell'indice.
 
-        for match in matches:
-            occurrences.setdefault(int(match.group(1)), []).append(
-                (page["page"], match.group(0).strip()[:80])
+        for m in matches:
+            occurrences.setdefault(int(m.group(1)), []).append(
+                (page_no, m.group(0).strip()[:80])
             )
 
     entries, last = [], 0
-
     for number in sorted(occurrences):
-        nxt = next(
-            ((pg, title) for pg, title in occurrences[number] if pg > last), None
-        )
+        nxt = next(((pg, t) for pg, t in occurrences[number] if pg > last), None)
         if nxt:
             entries.append((nxt[1], nxt[0]))
             last = nxt[0]
@@ -476,12 +550,10 @@ def snap_to_chapter(chapters, page_scores, min_page, max_page):
 
     for chapter in chapters:
         overlap = min(chapter["end"], max_page) - max(chapter["start"], min_page) + 1
-
         if overlap <= 0:
             continue
 
         mean_score = float(page_scores[chapter["start"] - 1 : chapter["end"]].mean())
-
         if best is None or mean_score > best[0]:
             best = (mean_score, chapter, overlap)
 
@@ -490,29 +562,49 @@ def snap_to_chapter(chapters, page_scores, min_page, max_page):
 
     _, chapter, overlap = best
     plausible = (chapter["end"] - chapter["start"] + 1) <= MAX_CHAPTER_PAGES
-
     return {"chapter": chapter, "snapped": overlap / region_len >= 0.5 and plausible}
 
 
 # ---------------------------------------------------------------------------
 # Spiegazione LLM
 # ---------------------------------------------------------------------------
-def explain_chunk(section: str, chunk: dict) -> str:
+def explain_chunk(section, texts, sec_page_scores, start, end) -> str:
+    """Passa all'LLM le 2 pagine più pertinenti del chunk (non solo l'inizio
+    del testo concatenato, che spesso taglia fuori proprio la parte rilevante)."""
+    ranked = np.argsort(sec_page_scores[start:end])[::-1][:2] + start
+    excerpt = "\n\n".join(
+        f"[pagina PDF {p + 1}]\n{texts[p][:EXCERPT_CHARS]}" for p in sorted(ranked)
+    )
+
     prompt = f"""Sei un assistente universitario. Devi spiegare perché un estratto di un libro è pertinente a un argomento di una lezione.
 
 ARGOMENTO DELLA LEZIONE:
 {section[:1200]}
 
-ESTRATTO DEL LIBRO (pagine PDF {chunk['start_page']}-{chunk['end_page']}, testo da OCR, può contenere errori):
-{chunk['text'][:1500]}
+ESTRATTO DEL LIBRO (pagine PDF {start + 1}-{end}, testo da OCR, può contenere errori):
+{excerpt}
 
 Rispondi in italiano con al massimo 2 frasi, citando concetti concreti presenti nell'estratto.
 Se l'estratto non è realmente pertinente all'argomento, dillo esplicitamente."""
 
-    resp = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
-    response_text = resp["message"]["content"]
+    resp = _ollama.chat(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        think=False,  # qwen3 altrimenti "ragiona" per centinaia di token inutili
+        options={"temperature": 0.1, "num_predict": 250},
+    )
+    text = resp["message"]["content"]
+    # Fallback per versioni di Ollama che ignorano think=False.
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
-    return re.sub(r"<think>.*?</think>", "", response_text, flags=re.S).strip()
+
+def _safe_explain(*args) -> str:
+    """Se la spiegazione fallisce il risultato principale resta comunque valido."""
+    try:
+        return explain_chunk(*args)
+    except Exception as e:
+        logger.warning("Spiegazione LLM fallita: %s: %s", type(e).__name__, e)
+        return f"(spiegazione non disponibile: {type(e).__name__})"
 
 
 # ---------------------------------------------------------------------------
@@ -521,71 +613,86 @@ Se l'estratto non è realmente pertinente all'argomento, dillo esplicitamente.""
 def analyze(pdf_path: str, lesson_summary: str, spiega: bool) -> dict:
     t0 = time.time()
     path = validate_pdf_path(pdf_path)
+    lesson_summary = lesson_summary or ""
 
-    sections = split_summary(lesson_summary or "")
+    if len(lesson_summary) > MAX_SUMMARY_CHARS:
+        raise AnalysisError(
+            "RIASSUNTO_TROPPO_LUNGO",
+            f"Il riassunto supera {MAX_SUMMARY_CHARS} caratteri.",
+        )
+
+    sections = split_summary(lesson_summary)
     if not sections:
         raise AnalysisError(
             "RIASSUNTO_NON_VALIDO",
             "Dal riassunto non è stata ricavata nessuna sezione didattica utile.",
             "Passa il testo completo del riassunto (almeno qualche frase per argomento).",
         )
+    if len(sections) > MAX_SECTIONS:
+        logger.warning(
+            "Sezioni %d > %d: uso solo le prime.", len(sections), MAX_SECTIONS
+        )
+        sections = sections[:MAX_SECTIONS]
 
-    pages = load_pages(path)
-    page_vecs = page_embeddings(path, pages)
-    chunks = build_chunks(pages, page_vecs)
+    # Solo la fase di cache (OCR + embedding) è serializzata per PDF.
+    with _path_lock(path):
+        texts = load_pages(path)
+        page_vecs = page_embeddings(path, texts)
+
+    bounds, chunk_vecs = build_chunks(page_vecs)
 
     query_vecs = normalize(
-        embed_batch(["search_query: " + section[:PIECE_CHARS] for section in sections])
+        embed_batch(["search_query: " + s[:PIECE_CHARS] for s in sections])
     )
 
-    page_scores = zscore_cols(page_vecs @ query_vecs.T).max(axis=1)
-    chunk_vecs = normalize(np.array([chunk["vector"] for chunk in chunks]))
+    page_z = zscore_cols(page_vecs @ query_vecs.T)  # (pagine, sezioni)
+    page_scores = page_z.max(axis=1)
     chunk_sims = zscore_cols(chunk_vecs @ query_vecs.T)
     chunk_scores = chunk_sims.max(axis=1)
     chunk_best_section = chunk_sims.argmax(axis=1)
 
     lo_p, hi_p = grow_region_pages(page_scores)
-    est_min, est_max = pages[lo_p]["page"], pages[hi_p]["page"]
+    est_min, est_max = lo_p + 1, hi_p + 1
     min_page, max_page = est_min, est_max
 
-    chapters, method = detect_chapters(path, pages)
+    chapters, method = detect_chapters(path, texts)
     anchor = {"metodo": method, "range_stimato_clustering": f"{est_min}-{est_max}"}
 
     if chapters:
         snap = snap_to_chapter(chapters, page_scores, est_min, est_max)
-
         if snap:
             chapter = snap["chapter"]
             anchor["capitolo"] = chapter["title"]
             anchor["range_capitolo"] = f"{chapter['start']}-{chapter['end']}"
             anchor["allineato_al_capitolo"] = snap["snapped"]
-
             if snap["snapped"]:
                 min_page, max_page = chapter["start"], chapter["end"]
 
     details = []
 
     if spiega:
-        in_region = [
-            index
-            for index, chunk in enumerate(chunks)
-            if chunk["end_page"] >= est_min and chunk["start_page"] <= est_max
-        ]
-        top = sorted(in_region, key=lambda index: chunk_scores[index], reverse=True)[:3]
+        top = pick_top_chunks(bounds, chunk_scores, lo_p, hi_p, MAX_EXPLAIN)
 
-        for index in sorted(top):
-            details.append(
-                {
-                    "pagine": f"{chunks[index]['start_page']}-{chunks[index]['end_page']}",
-                    "z_score": round(float(chunk_scores[index]), 3),
-                    "argomento_lezione": sections[
-                        chunk_best_section[index]
-                    ].splitlines()[0][:120],
-                    "motivazione": explain_chunk(
-                        sections[chunk_best_section[index]], chunks[index]
-                    ),
-                }
-            )
+        def job(i: int) -> str:
+            start, end = int(bounds[i][0]), int(bounds[i][1])
+            sec = int(chunk_best_section[i])
+            return _safe_explain(sections[sec], texts, page_z[:, sec], start, end)
+
+        if top:
+            # Utile se Ollama ha OLLAMA_NUM_PARALLEL > 1; altrimenti le richieste si accodano.
+            with ThreadPoolExecutor(max_workers=len(top)) as ex:
+                reasons = list(ex.map(job, top))
+
+            for i, reason in zip(top, reasons):
+                sec = int(chunk_best_section[i])
+                details.append(
+                    {
+                        "pagine": f"{int(bounds[i][0]) + 1}-{int(bounds[i][1])}",
+                        "z_score": round(float(chunk_scores[i]), 3),
+                        "argomento_lezione": sections[sec].splitlines()[0][:120],
+                        "motivazione": reason,
+                    }
+                )
 
     return {
         "status": "success",
@@ -602,23 +709,11 @@ def analyze(pdf_path: str, lesson_summary: str, spiega: bool) -> dict:
     }
 
 
-@mcp.tool()
-def analyze_lesson_ranges(
-    pdf_path: str, lesson_summary: str, spiega: bool = True
-) -> str:
-    """
-    Trova in quali pagine di un libro PDF locale è trattato l'argomento di una lezione universitaria.
-
-    Parametri:
-    - pdf_path: percorso assoluto del PDF sul Mac.
-    - lesson_summary: testo completo del riassunto o degli appunti della lezione.
-    - spiega: se True, aggiunge una breve motivazione per i passaggi più rilevanti.
-
-    Il risultato è un JSON con status "success" o "error". I numeri di pagina
-    sono riferiti al PDF, non necessariamente alla numerazione stampata nel libro.
-    """
+def _run_analysis(pdf_path: str, lesson_summary: str, spiega: bool) -> str:
+    """Esegue l'analisi e traduce ogni eccezione in un JSON di errore."""
     try:
-        result = analyze(pdf_path, lesson_summary, spiega)
+        with _ANALYSIS_SLOTS:
+            result = analyze(pdf_path, lesson_summary, spiega)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     except AnalysisError as e:
@@ -633,7 +728,14 @@ def analyze_lesson_ranges(
             )
         return _error("OLLAMA_ERRORE", f"Errore da Ollama: {e.error}")
 
-    except ConnectionError:
+    except (httpx.TimeoutException, TimeoutError):
+        return _error(
+            "OLLAMA_TIMEOUT",
+            f"Ollama non ha risposto entro {OLLAMA_TIMEOUT:.0f}s.",
+            "Riprova (i modelli freddi impiegano di più) o alza OLLAMA_TIMEOUT.",
+        )
+
+    except (ConnectionError, httpx.ConnectError):
         return _error(
             "OLLAMA_NON_RAGGIUNGIBILE",
             "Impossibile connettersi a Ollama.",
@@ -641,24 +743,40 @@ def analyze_lesson_ranges(
         )
 
     except Exception as e:
-        tb = traceback.format_exc()
-
-        log(f"Errore imprevisto: {type(e).__name__}: {e}")
-        log(tb)
-
-        return json.dumps(
-            {
-                "status": "error",
-                "error_code": "ERRORE_INTERNO",
-                "message": f"{type(e).__name__}: {e}",
-                "traceback": tb,
-            },
-            ensure_ascii=False,
-            indent=2,
+        # Il traceback resta nei log locali: al client (magari via tunnel) non va esposto.
+        logger.error(
+            "Errore imprevisto: %s: %s\n%s", type(e).__name__, e, traceback.format_exc()
+        )
+        return _error(
+            "ERRORE_INTERNO", f"{type(e).__name__}: {e}", "Controlla i log del server."
         )
 
 
+@mcp.tool()
+async def analyze_lesson_ranges(
+    pdf_path: str, lesson_summary: str, spiega: bool = True
+) -> str:
+    """
+    Trova in quali pagine di un libro PDF locale è trattato l'argomento di una lezione universitaria.
+
+    Parametri:
+    - pdf_path: percorso assoluto del PDF sul Mac.
+    - lesson_summary: testo completo del riassunto o degli appunti della lezione.
+    - spiega: se True, aggiunge una breve motivazione per i passaggi più rilevanti.
+
+    Il risultato è un JSON con status "success" o "error". I numeri di pagina
+    sono riferiti al PDF, non necessariamente alla numerazione stampata nel libro.
+    """
+    # Il lavoro è CPU/IO-bound e dura anche minuti (OCR): in un thread, per non
+    # bloccare l'event loop e quindi il server MCP.
+    return await asyncio.to_thread(_run_analysis, pdf_path, lesson_summary, spiega)
+
+
 if __name__ == "__main__":
+    logger.info("Python: %s", sys.executable)
+    logger.info("Tesseract: %s", pytesseract.pytesseract.tesseract_cmd)
+    logger.info("Cartelle consentite: %s", BASE_DIRS)
+
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
 
     if transport == "stdio":
@@ -668,12 +786,18 @@ if __name__ == "__main__":
         tunnel_host = os.environ.get("MCP_ALLOWED_HOST")
 
         if tunnel_host:
+            extra_origins = [
+                o.strip()
+                for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",")
+                if o.strip()
+            ]
             kwargs["transport_security"] = TransportSecuritySettings(
                 allowed_hosts=[tunnel_host, "127.0.0.1:*", "localhost:*"],
                 allowed_origins=[
                     "https://chatgpt.com",
                     "http://127.0.0.1:*",
                     "http://localhost:*",
+                    *extra_origins,
                 ],
             )
 
