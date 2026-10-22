@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -47,6 +49,7 @@ OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
 OCR_LANG = os.environ.get("OCR_LANG", "ita+eng")
 OCR_WORKERS = int(os.environ.get("OCR_WORKERS", min(8, os.cpu_count() or 4)))
 OCR_PAGE_TIMEOUT = 60  # secondi massimi per una singola pagina
+OCR_DEBUG = os.environ.get("OCR_DEBUG", "0") == "1"
 
 MAX_PDF_MB = int(os.environ.get("MAX_PDF_MB", "500"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "3000"))
@@ -64,7 +67,7 @@ IGNORED_PREFIXES = tuple(
 )
 
 # Cartelle da cui è consentito leggere i PDF (separate da os.pathsep).
-# Esempio macOS: PDF_BASE_DIRS="~/Downloads:/Volumes/Wang-SSD-2"
+# Esempio macOS: PDF_BASE_DIRS="~/Downloads:/Volumes/Eight-SSD"
 BASE_DIRS = [
     os.path.realpath(os.path.expanduser(d))
     for d in os.environ.get("PDF_BASE_DIRS", "~").split(os.pathsep)
@@ -84,6 +87,28 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("pdf_range_analyzer")
+
+
+# ---------------------------------------------------------------------------
+# Percorso del binario Tesseract
+# ---------------------------------------------------------------------------
+def _resolve_tesseract() -> str:
+    """Il server può partire con un PATH più povero del terminale: se
+    `tesseract` non si trova nel PATH, provo i percorsi tipici di Homebrew."""
+    explicit = os.environ.get("TESSERACT_CMD")
+    if explicit:
+        return explicit
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+        if os.path.isfile(candidate):
+            return candidate
+    return "tesseract"
+
+
+TESSERACT_CMD = _resolve_tesseract()
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 mcp = MCPServer("PDF Range Analyzer")
 _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
@@ -214,22 +239,72 @@ def _load_pages_cache(cache_file: Path, total: int) -> list[str] | None:
 # ---------------------------------------------------------------------------
 # Estrazione testo + OCR
 # ---------------------------------------------------------------------------
-def _ocr_image(img: Image.Image) -> str:
+_ocr_stats_lock = threading.Lock()
+_ocr_stats = {"errors": 0, "last": None, "debug_saved": False}
+MAX_LOGGED_OCR_ERRORS = 5
+
+
+def _reset_ocr_stats() -> None:
+    with _ocr_stats_lock:
+        _ocr_stats["errors"] = 0
+        _ocr_stats["last"] = None
+
+
+def _record_ocr_error(message: str) -> None:
+    with _ocr_stats_lock:
+        _ocr_stats["errors"] += 1
+        _ocr_stats["last"] = message
+        n = _ocr_stats["errors"]
+    if n <= MAX_LOGGED_OCR_ERRORS:
+        logger.error("OCR errore #%d: %s", n, message)
+
+
+def _maybe_save_debug_image(img: Image.Image) -> None:
+    if not OCR_DEBUG:
+        return
+    with _ocr_stats_lock:
+        if _ocr_stats["debug_saved"]:
+            return
+        _ocr_stats["debug_saved"] = True
     try:
-        # Byte grezzi + decodifica tollerante: evita l'UnicodeDecodeError di
-        # pytesseract senza forzare latin-1 (che rovinerebbe gli accenti).
-        raw = pytesseract.image_to_string(
-            img,
-            lang=OCR_LANG,
+        target = "/tmp/ocr_debug_page.png"
+        img.save(target)
+        logger.info("OCR_DEBUG: salvata la prima immagine in %s", target)
+    except Exception as e:
+        logger.warning("OCR_DEBUG: impossibile salvare l'immagine: %s", e)
+
+
+def _ocr_image(img: Image.Image) -> str:
+    """Chiama direttamente il binario tesseract: immagine su stdin, testo su
+    stdout. stderr viene decodificato con errors="replace", quindi l'errore
+    reale di Tesseract finisce nei log invece di un UnicodeDecodeError."""
+    _maybe_save_debug_image(img)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", compress_level=1)
+
+    try:
+        proc = subprocess.run(
+            [TESSERACT_CMD, "stdin", "stdout", "-l", OCR_LANG],
+            input=buf.getvalue(),
+            capture_output=True,
             timeout=OCR_PAGE_TIMEOUT,
-            output_type=pytesseract.Output.BYTES,
         )
-        return raw.decode("utf-8", errors="replace").replace("\ufffd", "").strip()
-    except pytesseract.TesseractNotFoundError:
-        raise
-    except Exception as e:  # una pagina illeggibile non deve far fallire il libro
-        logger.warning("OCR fallito su una pagina: %s", e)
+    except FileNotFoundError:
+        raise pytesseract.TesseractNotFoundError()
+    except subprocess.TimeoutExpired:
+        _record_ocr_error(f"timeout di {OCR_PAGE_TIMEOUT}s su una pagina")
         return ""
+    except Exception as e:  # una pagina illeggibile non deve far fallire il libro
+        _record_ocr_error(f"{type(e).__name__}: {e}")
+        return ""
+
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        _record_ocr_error(f"tesseract exit {proc.returncode}: {err[:500]}")
+        return ""
+
+    return proc.stdout.decode("utf-8", errors="replace").replace("\ufffd", "").strip()
 
 
 def _extract_texts(doc, total: int) -> list[str]:
@@ -237,6 +312,7 @@ def _extract_texts(doc, total: int) -> list[str]:
     chiamante (documento aperto una volta sola). Solo Tesseract, che gira in
     sottoprocessi, è parallelizzato. Le immagini in coda sono limitate per non
     riempire la RAM."""
+    _reset_ocr_stats()
     texts = [""] * total
     pending: deque = deque()
     max_pending = OCR_WORKERS * 2
@@ -307,16 +383,33 @@ def load_pages(pdf_path: str) -> list[str]:
         except pytesseract.TesseractNotFoundError:
             raise AnalysisError(
                 "TESSERACT_MANCANTE",
-                "Tesseract OCR non è installato o non è nel PATH.",
-                "Installa con `brew install tesseract tesseract-lang`.",
+                f"Tesseract OCR non è installato o non è raggiungibile ({TESSERACT_CMD}).",
+                "Installa con `brew install tesseract tesseract-lang` oppure imposta TESSERACT_CMD.",
             )
         logger.info("Estrazione completata in %.1fs", time.time() - t0)
 
-    if sum(len(t) for t in texts) < 200:
+    total_chars = sum(len(t) for t in texts)
+    empty = sum(1 for t in texts if len(t) < OCR_MIN_CHARS)
+    logger.info(
+        "Testo estratto: %d caratteri, %d/%d pagine sotto %d caratteri, errori OCR: %d",
+        total_chars,
+        empty,
+        total,
+        OCR_MIN_CHARS,
+        _ocr_stats["errors"],
+    )
+
+    if total_chars < 200:
+        last = _ocr_stats["last"]
+        detail = (
+            f" Errori OCR: {_ocr_stats['errors']}. Ultimo: {last}"
+            if _ocr_stats["errors"]
+            else " Nessun errore OCR registrato: Tesseract ha restituito testo vuoto."
+        )
         raise AnalysisError(
             "PDF_SENZA_TESTO",
-            "Dal PDF è stato estratto praticamente nessun testo.",
-            "Il file potrebbe essere protetto oppure l'OCR potrebbe non aver riconosciuto le pagine.",
+            "Dal PDF è stato estratto praticamente nessun testo." + detail,
+            "Controlla i log del server (righe 'OCR errore') e prova OCR_DEBUG=1.",
         )
 
     _store_cache(cache_file, json.dumps(texts, ensure_ascii=False).encode("utf-8"))
@@ -772,10 +865,32 @@ async def analyze_lesson_ranges(
     return await asyncio.to_thread(_run_analysis, pdf_path, lesson_summary, spiega)
 
 
-if __name__ == "__main__":
+def _log_startup_diagnostics() -> None:
     logger.info("Python: %s", sys.executable)
-    logger.info("Tesseract: %s", pytesseract.pytesseract.tesseract_cmd)
+    logger.info("Tesseract (usato): %s", TESSERACT_CMD)
+    logger.info("which tesseract: %s", shutil.which("tesseract"))
+    logger.info("TESSDATA_PREFIX: %s", os.environ.get("TESSDATA_PREFIX"))
+    logger.info("PATH: %s", os.environ.get("PATH"))
+    logger.info("OCR_LANG=%s OCR_DPI=%s OCR_WORKERS=%s", OCR_LANG, OCR_DPI, OCR_WORKERS)
+    try:
+        r = subprocess.run(
+            [TESSERACT_CMD, "--list-langs"], capture_output=True, timeout=15
+        )
+        logger.info(
+            "tesseract --list-langs rc=%s\nOUT: %s\nERR: %s",
+            r.returncode,
+            r.stdout.decode("utf-8", "replace").strip(),
+            r.stderr.decode("utf-8", "replace").strip(),
+        )
+    except Exception as e:
+        logger.error(
+            "Impossibile eseguire tesseract --list-langs: %s: %s", type(e).__name__, e
+        )
     logger.info("Cartelle consentite: %s", BASE_DIRS)
+
+
+if __name__ == "__main__":
+    _log_startup_diagnostics()
 
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
 
